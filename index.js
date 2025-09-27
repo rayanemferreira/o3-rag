@@ -12,13 +12,6 @@ const EMB_MODEL = "all-minilm";
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434'; // ajuste se necessário
 const COLLECTION_NAME = 'conversas';
 
-async function getEmbedding(text) {
-  const res = await ollama.embeddings({
-    model: EMB_MODEL,
-    prompt: text,
-  }, { host: OLLAMA_HOST });
-  return res.embedding;
-}
 const app = express();
 app.use(express.json());
 
@@ -84,27 +77,63 @@ app.post("/ia", async (req, res) => {
 
   try {
     if (!collection) return res.status(503).send("ChromaDB indisponível no momento.");
+    await collectionReady;
+
+    // 1) gera embedding da pergunta
+    const queryEmbedding = await generateEmbedding(text);
+
+    // 2) busca top-K documentos similares
+    const topK = 5;
+    const q = await collection.query({
+      queryEmbeddings: [queryEmbedding],
+      nResults: topK,
+      include: ["documents", "metadatas", "distances"],
+    });
+
+    const ids = (q.ids && q.ids[0]) || [];
+    const docs = (q.documents && q.documents[0]) || [];
+    const metas = (q.metadatas && q.metadatas[0]) || [];
+    const dists = (q.distances && q.distances[0]) || [];
+
+    const context = docs
+      .map((d, i) => {
+        const meta = metas[i] || {};
+        const dist = typeof dists[i] === 'number' ? dists[i].toFixed(4) : dists[i];
+        return `Trecho ${i + 1} (id=${ids[i] || ''}, distancia=${dist})\n` +
+               `Data/hora: ${meta.datetime || ''} | Telefone: ${meta.phone || ''}\n` +
+               `${d}`;
+      })
+      .join("\n\n---\n\n");
+
+    const hasContext = docs.length > 0;
+    const prompt = `Você é um assistente especialista. Responda em português de forma objetiva.\n\n` +
+      (hasContext
+        ? `Use APENAS as informações a seguir como contexto (não invente):\n\n${context}\n\n`
+        : `Não há contexto recuperado do banco. Responda apenas com base na pergunta.\n\n`) +
+      `Pergunta do usuário: ${text}\n\n` +
+      `Se a resposta não estiver claramente no contexto, diga que não foi possível encontrar com base nos dados.`;
+
+    // 3) chama o modelo no Ollama com prompt contextualizado
     const response = await axios.post(`${OLLAMA_HOST}/api/generate`, {
       model: "llama3.2",
-      prompt: text,
+      prompt,
       stream: false,
     });
 
-    const respData = response.data.response.toString();
+    const answer = response?.data?.response?.answer || "";
+    const sources = docs.map((d, i) => ({
+      id: ids[i],
+      document: d,
+      metadata: metas[i] || {},
+      distance: dists[i],
+    }));
 
-    // gera embedding real da pergunta+resposta
-    const embedding = await generateEmbedding(`Pergunta: ${text} | Resposta: ${respData}`);
-
-    await collectionReady; // garante que a coleção existe
-
-    const docId = Date.now().toString();
-    await collection.add({
-      ids: [docId],
-      documents: [`Pergunta: ${text} | Resposta: ${respData}`],
-      embeddings: [embedding],
+    res.json({
+      ok: true,
+      model: response?.data?.model || "llama3.2",
+      answer,
+      references: sources,
     });
-
-    res.send(respData);
   } catch (err) {
     console.error("Erro ao chamar Ollama:", err.message);
     res.status(500).send("Erro ao gerar resposta da IA.");
@@ -129,8 +158,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
       try {
         // gera embedding da linha
-        // const emb = await generateEmbedding(parsed.message);
-        const emb = await getEmbedding(parsed.message);
+        const emb = await generateEmbedding(parsed.message);
 
         const docId = Date.now().toString() + "_" + i;
 
