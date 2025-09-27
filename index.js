@@ -9,35 +9,44 @@ import ollama from 'ollama';
  
 // modelo de embedding
 const EMB_MODEL = "all-minilm";
-const OLLAMA_HOST = 'http://localhost:11434'; // ajuste se necessário
-const COLLECTION_NAME = 'minha_colecao';
+const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434'; // ajuste se necessário
+const COLLECTION_NAME = 'conversas';
 
 async function getEmbedding(text) {
   const res = await ollama.embeddings({
     model: EMB_MODEL,
     prompt: text,
-  });
+  }, { host: OLLAMA_HOST });
   return res.embedding;
 }
 const app = express();
 app.use(express.json());
 
+// garante diretório de uploads
+if (!fs.existsSync("uploads")) {
+  fs.mkdirSync("uploads", { recursive: true });
+}
+
 // Config upload (destino temporário)
 const upload = multer({ dest: "uploads/" });
 
 // conecta no servidor Chroma
-const chroma = new ChromaClient({ host: "localhost", port: 8000 });
+const CHROMA_URL = 'http://localhost:8000';
+const chroma = new ChromaClient({ path: CHROMA_URL });
 
 // garante que a coleção existe
 let collection;
-(async () => {
-  collection = await chroma.getOrCreateCollection({
-    name: "conversas",
-  metadata: { "hnsw:space": "cosine" },
-  embeddingFunction: null, // vamos gerar manualmente
-
-  });
-  console.log("Coleção 'conversas' pronta!");
+const collectionReady = (async () => {
+  try {
+    collection = await chroma.getOrCreateCollection({
+      name: COLLECTION_NAME,
+      metadata: { "hnsw:space": "cosine" },
+      embeddingFunction: null, // vamos gerar manualmente
+    });
+    console.log(`Coleção '${COLLECTION_NAME}' pronta!`);
+  } catch (err) {
+    console.error("Falha ao conectar no ChromaDB:", err.message);
+  }
 })();
 
 
@@ -61,12 +70,11 @@ function parseLine(line) {
 
 // --- helper: gerar embedding real ---
 async function generateEmbedding(text) {
-
-    
-  
-  const resp = ollama.embeddings(model=EMB_MODEL, prompt=text)
-  return resp["embedding"]
-  
+  const res = await ollama.embeddings({
+    model: EMB_MODEL,
+    prompt: text,
+  }, { host: OLLAMA_HOST });
+  return res.embedding;
 }
 
 // rota principal que chama o Ollama
@@ -75,7 +83,8 @@ app.post("/ia", async (req, res) => {
   if (!text) return res.status(400).send("Texto é obrigatório");
 
   try {
-    const response = await axios.post("http://127.0.0.1:11434/api/generate", {
+    if (!collection) return res.status(503).send("ChromaDB indisponível no momento.");
+    const response = await axios.post(`${OLLAMA_HOST}/api/generate`, {
       model: "llama3.2",
       prompt: text,
       stream: false,
@@ -85,6 +94,8 @@ app.post("/ia", async (req, res) => {
 
     // gera embedding real da pergunta+resposta
     const embedding = await generateEmbedding(`Pergunta: ${text} | Resposta: ${respData}`);
+
+    await collectionReady; // garante que a coleção existe
 
     const docId = Date.now().toString();
     await collection.add({
@@ -105,6 +116,8 @@ app.post("/upload", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).send("Arquivo é obrigatório");
 
   try {
+    if (!collection) return res.status(503).send("ChromaDB indisponível no momento.");
+    await collectionReady; // garante que a coleção existe
     const content = fs.readFileSync(req.file.path, "utf-8");
     const lines = content.split("\n");
 
@@ -167,8 +180,38 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
 // rota para listar todos documentos
 app.get("/list", async (req, res) => {
-  const results = await collection.get();
-  res.json(results);
+  try {
+    if (!collection) return res.status(503).send("ChromaDB indisponível no momento.");
+    await collectionReady; // garante que a coleção existe
+    const results = await collection.get({
+      include: ["embeddings", "documents", "metadatas"],
+    });
+    res.json(results);
+  } catch (err) {
+    console.error("Erro ao listar:", err.message);
+    res.status(500).send("Erro ao listar documentos");
+  }
+});
+
+// rota para buscar um subconjunto com embeddings garantidos
+app.post("/list_with_embeddings", async (req, res) => {
+  try {
+    if (!collection) return res.status(503).send("ChromaDB indisponível no momento.");
+    await collectionReady;
+    const { ids, limit } = req.body || {};
+    const options = { include: ["embeddings", "documents", "metadatas"] };
+    if (Array.isArray(ids) && ids.length > 0) {
+      options.ids = ids;
+    }
+    if (typeof limit === 'number' && limit > 0) {
+      options.limit = limit;
+    }
+    const results = await collection.get(options);
+    res.json(results);
+  } catch (err) {
+    console.error("Erro ao listar com embeddings:", err.message);
+    res.status(500).send("Erro ao listar com embeddings");
+  }
 });
 
 // rota para buscar
@@ -177,6 +220,8 @@ app.post("/search", async (req, res) => {
   if (!query) return res.status(400).send("Query é obrigatória");
 
   try {
+    if (!collection) return res.status(503).send("ChromaDB indisponível no momento.");
+    await collectionReady; // garante que a coleção existe
     const queryEmb = await generateEmbedding(query);
 
     const results = await collection.query({
