@@ -5,36 +5,31 @@ import multer from "multer";
 import fs from "fs";
 import ollama from 'ollama';
 
- 
- 
-// modelo de embedding
-const EMB_MODEL = "all-minilm";
-const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434'; // ajuste se necessário
+const EMB_MODEL = process.env.EMB_MODEL || "all-minilm";
+const GEN_MODEL = process.env.GEN_MODEL || "llama3.2";
+const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434'; 
 const COLLECTION_NAME = 'conversas';
-
+const DIST_THRESHOLD = Number(process.env.DIST_THRESHOLD || '0.6');
 const app = express();
-app.use(express.json());
 
-// garante diretório de uploads
+
+app.use(express.json());
 if (!fs.existsSync("uploads")) {
   fs.mkdirSync("uploads", { recursive: true });
 }
 
-// Config upload (destino temporário)
-const upload = multer({ dest: "uploads/" });
 
-// conecta no servidor Chroma
+const upload = multer({ dest: "uploads/" });
 const CHROMA_URL = 'http://localhost:8000';
 const chroma = new ChromaClient({ path: CHROMA_URL });
 
-// garante que a coleção existe
 let collection;
 const collectionReady = (async () => {
   try {
     collection = await chroma.getOrCreateCollection({
       name: COLLECTION_NAME,
       metadata: { "hnsw:space": "cosine" },
-      embeddingFunction: null, // vamos gerar manualmente
+      embeddingFunction: null, 
     });
     console.log(`Coleção '${COLLECTION_NAME}' pronta!`);
   } catch (err) {
@@ -43,25 +38,6 @@ const collectionReady = (async () => {
 })();
 
 
- 
- 
-// --- helper: parse de linha do WhatsApp ---
-function parseLine(line) {
-  const regex = /^(\d{2}\/\d{2}\/\d{4}) (\d{2}:\d{2}) - ([^:]+): (.*)$/;
-  const m = line.match(regex);
-  if (!m) return null;
-  const [_, datePart, timePart, phonePart, msgPart] = m;
-  const [dd, mm, yyyy] = datePart.split("/");
-  const iso = `${yyyy}-${mm}-${dd}T${timePart}:00`;
-  return {
-    datetime: iso,
-    phone: phonePart.trim(),
-    message: msgPart.trim(),
-    raw: line,
-  };
-}
-
-// --- helper: gerar embedding real ---
 async function generateEmbedding(text) {
   const res = await ollama.embeddings({
     model: EMB_MODEL,
@@ -70,69 +46,73 @@ async function generateEmbedding(text) {
   return res.embedding;
 }
 
-// rota principal que chama o Ollama
-app.post("/ia", async (req, res) => {
-  const { text } = req.body;
+
+
+app.post("/ia-prompt", async (req, res) => {
+  const { text, threshold, topK } = req.body;
   if (!text) return res.status(400).send("Texto é obrigatório");
 
   try {
-    if (!collection) return res.status(503).send("ChromaDB indisponível no momento.");
     await collectionReady;
+    if (!collection) return res.status(503).send("ChromaDB indisponível no momento.");
 
-    // 1) gera embedding da pergunta
-    const queryEmbedding = await generateEmbedding(text);
-
-    // 2) busca top-K documentos similares
-    const topK = 5;
+    
+    const queryEmbedding = await generateEmbedding(text);  
+    console.log(`[ia-prompt] embedding dimensão=${Array.isArray(queryEmbedding) ? queryEmbedding.length : 'n/a'}`);
+    const k = typeof topK === 'number' && topK > 0 ? Math.min(20, topK) : 5;
     const q = await collection.query({
       queryEmbeddings: [queryEmbedding],
-      nResults: topK,
+      nResults: k,
       include: ["documents", "metadatas", "distances"],
     });
 
     const ids = (q.ids && q.ids[0]) || [];
-    const docs = (q.documents && q.documents[0]) || [];
-    const metas = (q.metadatas && q.metadatas[0]) || [];
+    const docsRaw = ((q.documents && q.documents[0]) || []).map(String);
     const dists = (q.distances && q.distances[0]) || [];
+    const thr = typeof threshold === 'number' ? threshold : DIST_THRESHOLD;
+    const filtered = docsRaw.filter((_, i) => typeof dists[i] === 'number' ? dists[i] <= thr : true);
+    const docs = Array.from(new Set(filtered));
+    console.log(`[ia-prompt] hits=${ids.length} kept=${docs.length} threshold=${thr} k=${k} dists=${JSON.stringify(dists)}`);
 
     const context = docs
-      .map((d, i) => {
-        const meta = metas[i] || {};
-        const dist = typeof dists[i] === 'number' ? dists[i].toFixed(4) : dists[i];
-        return `Trecho ${i + 1} (id=${ids[i] || ''}, distancia=${dist})\n` +
-               `Data/hora: ${meta.datetime || ''} | Telefone: ${meta.phone || ''}\n` +
-               `${d}`;
-      })
+      .map((d) => `${d}`)
       .join("\n\n---\n\n");
 
     const hasContext = docs.length > 0;
-    const prompt = `Você é um assistente especialista. Responda em português de forma objetiva.\n\n` +
+    if (!hasContext) {
+      return res.json({ ok: true, model: "llama3.2", answer: "Não encontrei essa informação no contexto." });
+    }
+    const prompt =
       (hasContext
-        ? `Use APENAS as informações a seguir como contexto (não invente):\n\n${context}\n\n`
-        : `Não há contexto recuperado do banco. Responda apenas com base na pergunta.\n\n`) +
-      `Pergunta do usuário: ${text}\n\n` +
-      `Se a resposta não estiver claramente no contexto, diga que não foi possível encontrar com base nos dados.`;
+        ? `Você é um assistente que responde de forma direta e concisa com base SOMENTE no CONTEXTO abaixo.\n` +
+          `- Se não houver informação no contexto, responda exatamente: "Não encontrei essa informação no contexto."\n\n` +
+          `CONTEXTO:\n${context}\n\n` +
+          `PERGUNTA:\n${text}\n\n` +
+          `RESPOSTA:`
+        : `Não há contexto recuperado do banco. Responda apenas com base na pergunta, de forma objetiva.\n\n` +
+          `${text}\n\n` +
+          `RESPOSTA:`);
 
-    // 3) chama o modelo no Ollama com prompt contextualizado
+    
     const response = await axios.post(`${OLLAMA_HOST}/api/generate`, {
-      model: "llama3.2",
+      model: GEN_MODEL,
       prompt,
       stream: false,
+      options: { temperature: 0 }
     });
 
-    const answer = response?.data?.response?.answer || "";
-    const sources = docs.map((d, i) => ({
-      id: ids[i],
-      document: d,
-      metadata: metas[i] || {},
-      distance: dists[i],
-    }));
-
+    
+    const rawText = typeof response?.data?.response === "string" ? response.data.response : "";
+    const answer = rawText
+      .split(/\r?\n/)
+      .map(s => s.trim())
+      .filter(s => s.length > 0)
+      .slice(0, 4)
+      .join("\n");
     res.json({
       ok: true,
-      model: response?.data?.model || "llama3.2",
+      model: response?.data?.model || GEN_MODEL,
       answer,
-      references: sources,
     });
   } catch (err) {
     console.error("Erro ao chamar Ollama:", err.message);
@@ -140,43 +120,39 @@ app.post("/ia", async (req, res) => {
   }
 });
 
-
 app.post("/upload", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).send("Arquivo é obrigatório");
 
   try {
+    await collectionReady;
     if (!collection) return res.status(503).send("ChromaDB indisponível no momento.");
-    await collectionReady; // garante que a coleção existe
+
     const content = fs.readFileSync(req.file.path, "utf-8");
     const lines = content.split("\n");
 
     let inseridos = 0;
 
     for (let i = 0; i < lines.length; i++) {
-      const parsed = parseLine(lines[i].trim());
-      if (!parsed) continue;
+      const lineText = lines[i].trim();
+      if (!lineText) continue;
 
       try {
-        // gera embedding da linha
-        const emb = await generateEmbedding(parsed.message);
+        const emb = await generateEmbedding(lineText);
 
         const docId = Date.now().toString() + "_" + i;
 
-        // insere imediatamente no Chroma
         await collection.add({
           ids: [docId],
-          documents: [parsed.message],
+          documents: [lineText], 
           embeddings: [emb],
           metadatas: [{
-            phone: parsed.phone,
-            datetime: parsed.datetime,
-            raw: parsed.raw,
             line_index: i,
+            raw: lineText 
           }],
         });
 
         inseridos++;
-        console.log(`✅ Linha ${i} inserida com embedding (${emb.length} dimensões)`);
+        console.log(`Linha ${i} inserida com embedding (${emb.length} dimensões)`);
 
       } catch (err) {
         console.error(`Erro ao processar linha ${i}:`, err.message);
@@ -195,22 +171,10 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
 
 
-// // rota para limpar a coleção (apagar todos documentos)
-// app.delete("/clear", async (req, res) => {
-//   try {
-//     await collection.delete({ ids: [] }); // se não passar ids, limpa tudo
-//     res.json({ ok: true, msg: "Coleção 'conversas' limpa com sucesso!" });
-//   } catch (err) {
-//     console.error("Erro ao limpar coleção:", err.message);
-//     res.status(500).send("Erro ao limpar a coleção.");
-//   }
-// });
-
-// rota para listar todos documentos
 app.get("/list", async (req, res) => {
   try {
+    await collectionReady; 
     if (!collection) return res.status(503).send("ChromaDB indisponível no momento.");
-    await collectionReady; // garante que a coleção existe
     const results = await collection.get({
       include: ["embeddings", "documents", "metadatas"],
     });
@@ -221,35 +185,16 @@ app.get("/list", async (req, res) => {
   }
 });
 
-// rota para buscar um subconjunto com embeddings garantidos
-app.post("/list_with_embeddings", async (req, res) => {
-  try {
-    if (!collection) return res.status(503).send("ChromaDB indisponível no momento.");
-    await collectionReady;
-    const { ids, limit } = req.body || {};
-    const options = { include: ["embeddings", "documents", "metadatas"] };
-    if (Array.isArray(ids) && ids.length > 0) {
-      options.ids = ids;
-    }
-    if (typeof limit === 'number' && limit > 0) {
-      options.limit = limit;
-    }
-    const results = await collection.get(options);
-    res.json(results);
-  } catch (err) {
-    console.error("Erro ao listar com embeddings:", err.message);
-    res.status(500).send("Erro ao listar com embeddings");
-  }
-});
 
-// rota para buscar
+
+
 app.post("/search", async (req, res) => {
   const { query } = req.body;
   if (!query) return res.status(400).send("Query é obrigatória");
 
   try {
+    await collectionReady;
     if (!collection) return res.status(503).send("ChromaDB indisponível no momento.");
-    await collectionReady; // garante que a coleção existe
     const queryEmb = await generateEmbedding(query);
 
     const results = await collection.query({
@@ -264,6 +209,75 @@ app.post("/search", async (req, res) => {
   }
 });
 
+
+app.post("/ia", async (req, res) => {
+  const { text, threshold, topK } = req.body;
+  if (!text) return res.status(400).send("Texto é obrigatório");
+
+  try {
+    await collectionReady;
+    if (!collection) return res.status(503).send("ChromaDB indisponível no momento.");
+
+    const queryEmbedding = await generateEmbedding(text);
+    console.log(`[ia] embedding dimensão=${Array.isArray(queryEmbedding) ? queryEmbedding.length : 'n/a'}`);
+
+    const k = typeof topK === 'number' && topK > 0 ? Math.min(20, topK) : 5;
+    const q = await collection.query({
+      queryEmbeddings: [queryEmbedding],
+      nResults: k,
+      include: ["documents", "metadatas", "distances"],
+    });
+
+    const ids = (q.ids && q.ids[0]) || [];
+    const docsRaw = ((q.documents && q.documents[0]) || []).map(String);
+    const dists = (q.distances && q.distances[0]) || [];
+    const thr = typeof threshold === 'number' ? threshold : DIST_THRESHOLD;
+    const filtered = docsRaw.filter((_, i) => typeof dists[i] === 'number' ? dists[i] <= thr : true);
+    const docs = Array.from(new Set(filtered));
+    console.log(`[ia] hits=${ids.length} kept=${docs.length} threshold=${thr} k=${k} dists=${JSON.stringify(dists)}`);
+
+    const context = docs
+      .map((d) => `${d}`)
+      .join("\n\n---\n\n");
+
+    const hasContext = docs.length > 0;
+    if (!hasContext) {
+      return res.send("Não encontrei essa informação no contexto.");
+    }
+    const prompt =
+      (hasContext
+        ? `Você é um assistente que responde de forma direta e concisa com base SOMENTE no CONTEXTO abaixo.\n` +
+          `- Se não houver informação no contexto, responda exatamente: "Não encontrei essa informação no contexto."\n\n` +
+          `CONTEXTO:\n${context}\n\n` +
+          `PERGUNTA:\n${text}\n\n` +
+          `RESPOSTA:`
+        : `Não há contexto recuperado do banco. Responda apenas com base na pergunta, de forma objetiva.\n\n` +
+          `${text}\n\n` +
+          `RESPOSTA:`);
+
+    const response = await axios.post(`${OLLAMA_HOST}/api/generate`, {
+      model: GEN_MODEL,
+      prompt,
+      stream: false,
+      options: { temperature: 0 }
+    });
+
+    const rawText = typeof response?.data?.response === "string" ? response.data.response : "";
+    const answer = rawText
+      .split(/\r?\n/)
+      .map(s => s.trim())
+      .filter(s => s.length > 0)
+      .slice(0, 4)
+      .join("\n");
+
+    res.send(answer);
+  } catch (err) {
+    console.error("Erro ao chamar Ollama:", err.message);
+    res.status(500).send("Erro ao gerar resposta da IA.");
+  }
+});
+
+
 app.listen(3000, () => {
-  console.log("Servidor rodando na porta 3000 🚀");
+  console.log("Servidor rodando na porta 3000");
 });
