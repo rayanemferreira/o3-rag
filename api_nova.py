@@ -117,10 +117,10 @@ async def query(req: QueryRequest):
     logger.info(f"Received query: {q}")
 
     q_embed = ollama_embed(q)
-    logger.info(f"ollama_embed query: {q_embed}")
+    # logger.info(f"ollama_embed query: {q_embed}")
 
     results = collection.query(query_embeddings=[q_embed], n_results=k, include=['documents','metadatas','distances'])
-    logger.info(f"results query: {results}")
+    # logger.info(f"results query: {results}")
 
     docs = results.get('documents', [[]])[0]
     metas = results.get('metadatas', [[]])[0]
@@ -133,13 +133,36 @@ async def query(req: QueryRequest):
         context_pieces.append(f"Source: {src or 'unknown'}\n{d}")
     context = "\n---\n".join(context_pieces)
 
-    prompt = f"You are an assistant. Use the following context to answer the user's question.\n\nCONTEXT:\n{context}\n\nQUESTION:\n{q}\n\nPlease provide a helpful answer and cite the relevant context sources in-line."
 
-    answer = ollama_generate(prompt)
+    system_msg=("Você é um assistente especializado que responde de forma curta, clara e correta. "
+    "Use SOMENTE o contexto fornecido abaixo (Q/A históricas) para fundamentar sua respta correta"
+    "Se o contexto não for suficiente, explique a limitação e peça mais detalhes. "
+    "Cite quais Q/As inspiraram a resposta, referenciando os IDs quando possivel.")
+
+    user_msg = (
+    f"Pergunta do usuário:\n{q}\n\n"
+    f" ----- CONTEXTO (Q/As relevantes) ----- \n{context}\n\n"
+    "Regras:\n"
+    "1) Baseie-se ňo contexto. \n"
+    "2) Seja preciso.\n"
+    "3) Se faltarem detalhes, diga o que falta. \n"
+    "4) Ao final, liste 'Fontes (IDs aproximados)' com os IDs (se disponíveis) ou breve ref"
+    )
+
+    
+    resp = ollama.chat(
+        model=OLLAMA_LLM_MODEL,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg}
+        ],
+        options={"temperature": 0.2}
+    ) 
+
+
 
     return {
-        "answer": answer,
-        "sources": [{"id": ids[i], "source": metas[i].get('source'), "distance": distances[i], "text": docs[i]} for i in range(len(docs))]
+        resp["message"]["content"],        
     }
 
 @app.get("/health")
