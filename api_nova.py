@@ -162,7 +162,8 @@ async def query(req: QueryRequest):
 
 
     return {
-        resp["message"]["content"],        
+        "answer": resp["message"]["content"],
+        "sources": [{"distance": distances[i]} for i in range(len(docs))]
     }
 
 @app.get("/health")
