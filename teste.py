@@ -1,18 +1,17 @@
 import streamlit as st
 import requests
 
-st.image("img-grupo.jpeg", width=800)  # URL de exemplo
+st.image("img-grupo.jpeg", width=800)  
 
 st.title("Gerenciador de Grupo de WhatsApp")
 
 if "upload_done" not in st.session_state:
     st.session_state.upload_done = False
 
-# Criar containers para controle dinâmico
 upload_container = st.empty()
 ia_container = st.empty()
 
-# Renderizar upload se ainda não foi feito
+
 if not st.session_state.upload_done:
     with upload_container.form(key="upload_form"):
         st.subheader("Faça Upload da sua conversa do WhatsApp para o banco")
@@ -34,7 +33,7 @@ if not st.session_state.upload_done:
                         except Exception:
                             st.success(f"Arquivo enviado com sucesso! Resposta da API: {response.text}")
 
-                        # Marcar upload como feito e atualizar interface
+                        
                         st.session_state.upload_done = True
                         upload_container.empty()  # Remove o formulário de upload
                     else:

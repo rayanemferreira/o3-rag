@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import chromadb
 import ollama
+from fastapi.responses import PlainTextResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,10 +22,10 @@ chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
 COLLECTION_NAME = "documents"
 try:
     collection = chroma_client.get_collection(COLLECTION_NAME)
-    logger.info(f"Using existing collection: {COLLECTION_NAME}")
+    logger.info(f"usar colecao existente {COLLECTION_NAME}")
 except Exception:
     collection = chroma_client.create_collection(name=COLLECTION_NAME)
-    logger.info(f"Created new collection: {COLLECTION_NAME}")
+    logger.info(f"Criar uma colecao: {COLLECTION_NAME}")
 
 app = FastAPI(title="FastAPI + ChromaDB + Ollama RAG")
 
@@ -61,8 +62,8 @@ def ollama_generate(prompt: str) -> str:
         resp = ollama.generate(model=OLLAMA_LLM_MODEL, prompt=prompt)
         return resp["response"]
     except Exception as e:
-        logger.error(f"Ollama generate error: {e}")
-        raise HTTPException(status_code=500, detail=f"Ollama generate error: {str(e)}")
+        logger.error(f"Ollama generate erro: {e}")
+        raise HTTPException(status_code=500, detail=f"Ollama generate erro: {str(e)}")
 
 class QueryRequest(BaseModel):
     text: str
@@ -71,38 +72,38 @@ class QueryRequest(BaseModel):
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     if not file.filename.lower().endswith('.txt'):
-        raise HTTPException(status_code=400, detail="Only .txt files are supported")
+        raise HTTPException(status_code=400, detail="Somente arquivos .txt são suportados")
     contents = await file.read()
     text = contents.decode('utf-8', errors='ignore')
     sentences = split_into_sentences(text)
     if not sentences:
-        raise HTTPException(status_code=400, detail="No text found in file")
+        raise HTTPException(status_code=400, detail="Nenhum texto encontrado no arquivo")
 
     ids, metadatas, documents, embeddings = [], [], [], []
 
-    logger.info(f"Processing file {file.filename}, {len(sentences)} sentences")
+    logger.info(f"Processando o arquivo {file.filename}, {len(sentences)} sentences")
 
     for s in sentences:
         sid = str(uuid.uuid4())
         ids.append(sid)
-        metadatas.append({"source": file.filename})
+        metadatas.append({"fonte": file.filename})
         documents.append(s)
         try:
             emb = ollama_embed(s)
             embeddings.append(emb)
         except Exception as e:
-            logger.error(f"Failed to embed sentence: {e}")
+            logger.error(f"Falha ao incorporar a frase: {e}")
             continue
 
     if not embeddings:
-        raise HTTPException(status_code=500, detail="Failed to generate any embeddings")
+        raise HTTPException(status_code=500, detail="Falha ao gerar embeddings")
 
     collection.add(ids=ids, metadatas=metadatas, documents=documents, embeddings=embeddings)
     try:
         chroma_client.persist()
-        logger.info("Chroma persisted successfully")
+        logger.info("Chroma persistiu com sucesso")
     except Exception as e:
-        logger.warning(f"Chroma persist error: {e}")
+        logger.warning(f"Chroma esta com erro: {e}")
 
     return {"inserted": len(embeddings)}
 
@@ -112,15 +113,15 @@ async def query(req: QueryRequest):
     k = req.k
      
     if not q or not q.strip():
-        raise HTTPException(status_code=400, detail="query cannot be empty")
+        raise HTTPException(status_code=400, detail="a consulta não pode esta vazia")
 
-    logger.info(f"Received query: {q}")
+    logger.info(f"Consulta recebida: {q}")
 
     q_embed = ollama_embed(q)
-    # logger.info(f"ollama_embed query: {q_embed}")
+
 
     results = collection.query(query_embeddings=[q_embed], n_results=k, include=['documents','metadatas','distances'])
-    # logger.info(f"results query: {results}")
+    
 
     docs = results.get('documents', [[]])[0]
     metas = results.get('metadatas', [[]])[0]
@@ -161,10 +162,11 @@ async def query(req: QueryRequest):
 
 
 
-    return {
-        "answer": resp["message"]["content"],
-        "sources": [{"distance": distances[i]} for i in range(len(docs))]
-    }
+    answer = resp["message"]["content"]
+    distance = distances[0] if distances else None
+
+
+    return PlainTextResponse(f"{answer}\n\nDistância: {distance}")
 
 @app.get("/health")
 async def health():

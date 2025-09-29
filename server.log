@@ -1,7 +1,0 @@
-The 'path' argument is deprecated. Please use 'ssl', 'host', and 'port' instead
-Servidor rodando na porta 3000 🚀
-No embedding function configuration found for collection conversas. 'add' and 'query' will fail unless you provide them embeddings directly.
-Coleção 'conversas' pronta!
-Erro ao chamar Ollama: Expected 'include' items to be one of distances, documents, embeddings, metadatas, uris, but got ids
-Erro ao chamar Ollama: Expected 'include' items to be one of distances, documents, embeddings, metadatas, uris, but got ids
-^C
